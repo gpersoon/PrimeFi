@@ -74,6 +74,9 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	/// @notice Out of rewards
 	error OutOfRewards();
 
+	/// @notice Pool already exists
+	error PoolAlreadyExists();
+
 	/// @notice Emitted when the bounty manager is updated
 	event Disqualified(address indexed user);
 
@@ -139,6 +142,10 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	/// @notice protocol value by chain
 	mapping (uint32 => uint256) public protocolValueByChain;
 
+	mapping (Token => int256) public tokenValueInUSD;
+
+	uint256 public constant UPDATE_ORACLE_PERIOD = 240 seconds;
+
 	uint256 private constant WHOLE = 1e18; // 100%
 	
 	uint256 public constant REQUIRED_RATIO_AMOUNT = 5e16; // 5%
@@ -196,6 +203,8 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	/// @notice list of registered tokens
 	address[] public registeredTokens;
 
+	uint256 public lastOracleUpdateTime;
+
 	/// @notice Only side chain can call the function
 	modifier onlySidechain() {
 		require(!_isMainChain, OnlySidechain());
@@ -210,9 +219,10 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	
 	/// @notice update rewards for every action
 	modifier updateReward(address account, uint32 chainEid) {
-		totalProtocolValue = totalProtocolValue.sub(protocolValueByChain[chainEid]);
-		protocolValueByChain[chainEid] = _calculateProtocolValueInUSD(chainEid);
-		totalProtocolValue = totalProtocolValue.add(protocolValueByChain[chainEid]);
+		uint256 beforeVal = protocolValueByChain[chainEid];
+		uint256 afterVal = _calculateProtocolValueInUSD(chainEid);  
+		protocolValueByChain[chainEid] = afterVal;  
+		totalProtocolValue = totalProtocolValue.sub(before).add(afterVal);
         rewardPerTokenStored = rewardPerToken();
         lastUpdateTime = lastTimeRewardApplicable();
         if (account != address(0) && isEligibleForRewards(account, chainEid)) {
@@ -260,22 +270,16 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 		for (uint256 i; i < length; i++) {
 			tokens[i] = registeredTokens[i];
 		}
+
+		uint256 chainLength = _sidechains.length;
 		
-		for(uint32 chainEid = 0; chainEid < _sidechains.length; chainEid++) {
+		for(uint32 j; j < chainLength; j++) {
+			uint32 chainEid = _sidechains[j];
 			uint256[] memory _rewards = pendingRewards(chainEid, _user, tokens);
-			for (uint256 i; i < length; i++) {
-				pending = pending.add(_rewards[i]);
+			for (uint256 k; k < length; k++) {
+				pending = pending.add(_rewards[k]);
 			}
 		}
-	}
-
-	/**
-	 * @notice Returns the version of the sender and receiver OApp.
-	 * @return senderVersion The version of the sender OApp.
-	 * @return receiverVersion The version of the receiver OApp.
-	 */
-	function oAppVersion() public pure override returns (uint64 senderVersion, uint64 receiverVersion) {
-		return (SENDER_VERSION, RECEIVER_VERSION);
 	}
 
 	/**
@@ -284,15 +288,6 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
      */
 	function isMainChain() public view returns (bool) {
 		return _isMainChain;
-	}
-
-	/**
-     * @notice Converts an address to a bytes32 representation
-     * @param _addr The address to convert
-     * @return The bytes32 representation of the address
-     */
-	function addressToBytes32(address _addr) public pure returns (bytes32) {
-    	return bytes32(uint256(uint160(_addr)));
 	}
 
 	/**
@@ -338,15 +333,16 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	 * @param reward The amount of PRFI to be distributed
 	 * @param finishTimestamp The timestamp when the distribution will end
 	 */
-	function notifyRewardAmount(uint256 reward, uint256 finishTimestamp) external onlyOwner updateReward(address(0), 0) {
+	function notifyRewardAmount(uint256 reward, uint256 finishTimestamp) external onlyOwner onlyMainChain updateReward(address(0), 0) {
 		uint256 blockTimestamp = block.timestamp;
 		rewardsDuration = finishTimestamp - blockTimestamp;
+		uint256 _rewardsDuration = rewardsDuration;
         if (blockTimestamp >= periodFinish) {
-            prfiPerSecond = reward.div(rewardsDuration);
+            prfiPerSecond = reward.div(_rewardsDuration);
         } else {
             uint256 remaining = periodFinish.sub(blockTimestamp);
             uint256 leftover = remaining.mul(prfiPerSecond);
-            prfiPerSecond = reward.add(leftover).div(rewardsDuration);
+            prfiPerSecond = reward.add(leftover).div(_rewardsDuration);
         }
 
         lastUpdateTime = blockTimestamp;
@@ -366,27 +362,32 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 		mapping(Token => uint256) storage _tokenBalances = _balancesByChain[chainEid][_user];
 		mapping(Token => uint256) storage _totalSupply = totalSupplyByChain[chainEid];
 		mapping (address => uint256) storage _userRewardPerTokenPaid = userRewardPerTokenPaid[chainEid];
+		uint256 totalBalancesInUSD;
+		uint256 prfiValueInUSD;
 		for (uint256 i; i < length; i++) {
 			address token = _tokens[i];
 			Token tokenEnum = tokenAddresses[token];
+			if (tokenEnum == Token.INVALID_TOKEN) {
+				continue;
+			}
 			uint256 amount = _tokenBalances[tokenEnum];
 			uint256 protocolSupply = _totalSupply[tokenEnum];
 			uint256 _tokenBalanceValueInUSD = _getTokenValueInUSD(tokenEnum, amount);
 			uint256 _protocolValueInUSD = _getTokenValueInUSD(tokenEnum, protocolSupply);
 			if (tokenEnum == Token.PRFI) {
-				uint256 prfiValueInUSD = _tokenBalanceValueInUSD;
+				prfiValueInUSD = _tokenBalanceValueInUSD;
 				if (prfiValueInUSD == 0 || _protocolValueInUSD == 0) {
 					rewards_[i] = 0;
 					continue;
 				}
 				uint256 balancesInUSD = _tokenBalanceValueInUSD;
 				uint256 protocolValueInUSD = _protocolValueInUSD;
-				if (balancesInUSD.div(prfiValueInUSD) < REQUIRED_RATIO_AMOUNT) {
-					rewards_[i] = 0;
-					continue;
-				}
-				rewards_[i] = balancesInUSD.mul(rewardPerToken().sub(_userRewardPerTokenPaid[_user])).div(protocolValueInUSD).add(rewards[chainEid][_user]);
 			}
+			totalBalancesInUSD = totalBalancesInUSD.add(_tokenBalanceValueInUSD);
+			rewards_[i] = balancesInUSD.mul(rewardPerToken().sub(_userRewardPerTokenPaid[_user])).div(protocolValueInUSD);
+		}
+		if (balancesInUSD.mul(WHOLE).div(prfiValueInUSD) < REQUIRED_RATIO_AMOUNT) {
+			return new uint256[](length);
 		}
 		return rewards_;
 	}
@@ -401,7 +402,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 		uint256 prfiValueInUSD;
 		uint256 balancesInUSD;
 		mapping(Token => uint256) storage _tokenBalances = _balancesByChain[chainEid][user];
-		for (uint256 i = 1; i < uint(type(Token).max); i++) {
+		for (uint256 i = 1; i <= uint(type(Token).max); i++) {
 			Token token = Token(i);
 			if (!isTokenActive[token]) {
 				continue;
@@ -437,7 +438,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
      */
     function rewardPerToken() public view returns (uint256) {
         if (totalProtocolValue == 0) {
-            return rewardPerTokenStored;
+            return 0;
         }
         return
             rewardPerTokenStored.add(
@@ -477,7 +478,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 			protocolValueInUSD = protocolValueInUSD.add(_protocolValueInUSD);
 		}
 
-		if (balancesInUSD.div(userPrfiValueInUSD) < REQUIRED_RATIO_AMOUNT) {
+		if (balancesInUSD.mul(WHOLE).div(userPrfiValueInUSD) < REQUIRED_RATIO_AMOUNT) {
 			return rewards[chainEid][account];
 		}
 
@@ -509,6 +510,10 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	function setTokenAggregators(Token[] memory tokens_, IChainlinkAggregator[] memory aggregators_) external onlyOwner {
 		require(tokens_.length == aggregators_.length, InvalidLength());
 		for (uint256 i; i < tokens_.length; i++) {
+			if (tokens_[i] == Token.INVALID_TOKEN) {
+				continue;
+			}
+			
 			_setTokenAggregator(tokens_[i], aggregators_[i]);
 
 			isTokenActive[tokens_[i]] = true;
@@ -520,6 +525,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	 * @param mainChain_ The main chain layer zero ID
 	 */
 	function setMainChain(uint32 mainChain_) external onlyOwner {
+		_isMainChain = (mainChain_ == 0);
 		_mainChain = mainChain_;
 	}
 
@@ -534,17 +540,14 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	/**
 	 * @notice Quotes the fee for sending a message
 	 * @param _data The message to send
-	 * @param _options The message execution options
-	 * @param _payInLzToken Boolean for which token to return fee in
 	 * @return nativeFee The native fee
 	 * @return lzTokenFee The LZ token fee
 	 */
 	function quote(
-		bytes memory _data, // The message to send.
-		bytes memory _options, // Message execution options
-		bool _payInLzToken // boolean for which token to return fee in
+		bytes memory _data // The message to send.
 	) public view returns (uint256 nativeFee, uint256 lzTokenFee) {
-		MessagingFee memory fee = _quote(_mainChain, _data, _options, _payInLzToken);
+		bytes memory options = OptionsBuilder.newOptions().addExecutorLzReceiveOption(MAX_GAS_LIMIT, 0); 
+		MessagingFee memory fee = _quote(_mainChain, _data, _options, false);
 		return (fee.nativeFee, fee.lzTokenFee);
 	}
 
@@ -597,6 +600,14 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	function _getTokenValueInUSD(Token token, uint256 amount) internal view returns (uint256) {
 		IChainlinkAggregator aggregator = tokenAggregators[token];
 		require(address(aggregator) != address(0), ZeroAddress());
+		if (block.timestamp > lastOracleUpdateTime + UPDATE_ORACLE_PERIOD) {
+			// Update the oracle price
+			(,int256 price,,,) = aggregator.latestRoundData();
+			tokenValueInUSD[token] = price;
+			lastOracleUpdateTime = block.timestamp;
+		} else {
+			price = tokenValueInUSD[token];
+		}
 		(,int256 price,,,) = aggregator.latestRoundData();
 		uint8 decimals = aggregator.decimals();
 		return uint256(price).mul(amount).mul(WHOLE).div(10 ** decimals);
@@ -733,6 +744,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	 */
 	function addPool(address _token, uint256 _allocPoint) external {
 		require(msg.sender == poolConfigurator, NotAllowed());
+		require(validToken[_token] == false, PoolAlreadyExists());
 		validToken[_token] = true;
 		totalAllocPoint = totalAllocPoint.add(_allocPoint);
 		registeredTokens.push(_token);
@@ -750,7 +762,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	 * @notice Claim rewards. They are vested into MFD.
 	 * @param _user address for claim
 	 */
-	function claim(address _user, address[] memory /*_tokens*/) public whenNotPaused {
+	function claim(address _user, address[] memory /*_tokens*/) public {
 		claimAll(_user);
 	}
 
@@ -796,7 +808,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	function _vestTokens(address _user, uint256 _amount) internal {
 		require(_amount != 0, NothingToVest());
 		IMultiFeeDistribution _mfd = _getMfd();
-		_sendPrime(mfd, _amount);
+		_sendPrime(address(_mfd), _amount);
 		_mfd.vestTokens(_user, _amount, true);
 	}
 
@@ -879,8 +891,8 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	 */
 	function withdrawPrepaidGas() external {
 		address _user = _msgSender();
-		require(userPrepaidGas[_user] >= 0, InsufficientFee());
 		uint256 _amount = userPrepaidGas[_user];
+		require(_amount > 0, InsufficientFee());
 		delete userPrepaidGas[_user];
 		payable(_user).transfer(_amount);
 	}
@@ -905,11 +917,9 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 		if (_amount == 0) {
 			return;
 		}
-
-		address prfiToken = rewardMinter.getPrfiTokenAddress();
-		uint256 chefReserve = IERC20(prfiToken).balanceOf(address(this));
+		uint256 chefReserve = IERC20(_prfiToken).balanceOf(address(this));
 		require(_amount <= chefReserve, OutOfRewards());
-		IERC20(prfiToken).safeTransfer(_user, _amount);
+		IERC20(_prfiToken).safeTransfer(_user, _amount);
 	}
 
 	/**
@@ -959,7 +969,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 		for (uint256 i; i < length; ) {
 			PoolInfo storage pool = poolInfo[_tokens[i]];
 			require(pool.lastRewardTime != 0, UnknownPool());
-			_totalAllocPoint = _totalAllocPoint - pool.allocPoint + _allocPoints[i];
+			_totalAllocPoint = _totalAllocPoint.sub(pool.allocPoint).add(_allocPoints[i]);
 			pool.allocPoint = _allocPoints[i];
 			unchecked {
 				i++;
@@ -980,7 +990,7 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
      * @dev Peer is a bytes32 to accommodate non-evm chains.
      */
     function setPeer(uint32 _eid, bytes32 _peer) public override onlyOwner {
-		if (_isMainChain) {
+		if (_isMainChain && _peer != bytes32(0)) {
 			_sidechains.push(_eid);
 		}
 
