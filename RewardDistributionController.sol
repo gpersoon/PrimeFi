@@ -362,8 +362,11 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 	function pendingRewards(uint32 chainEid, address _user, address[] memory _tokens) public view returns (uint256[] memory) {
 		uint256 length = _tokens.length;
 		uint256[] memory rewards_ = new uint256[](length);
+		if (length == 0) {
+			return rewards_;
+		}
+		uint256[] memory _tokenValuesInUSD = new uint256[](length);
 		mapping(Token => uint256) storage _tokenBalances = _balancesByChain[chainEid][_user];
-		mapping(Token => uint256) storage _totalSupply = totalSupplyByChain[chainEid];
 		mapping (address => uint256) storage _userRewardPerTokenPaid = userRewardPerTokenPaid[chainEid];
 		uint256 totalBalancesInUSD;
 		uint256 prfiValueInUSD;
@@ -374,22 +377,28 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 				continue;
 			}
 			uint256 amount = _tokenBalances[tokenEnum];
-			uint256 protocolSupply = _totalSupply[tokenEnum];
 			uint256 _tokenBalanceValueInUSD = _getTokenValueInUSD(tokenEnum, amount);
-			uint256 _protocolValueInUSD = _getTokenValueInUSD(tokenEnum, protocolSupply);
 			if (tokenEnum == Token.PRFI) {
 				prfiValueInUSD = _tokenBalanceValueInUSD;
-				if (prfiValueInUSD == 0 || _protocolValueInUSD == 0) {
-					rewards_[i] = 0;
-					continue;
+				if (prfiValueInUSD == 0) {
+					return rewards_;
 				}
 			}
 			totalBalancesInUSD = totalBalancesInUSD.add(_tokenBalanceValueInUSD);
-			rewards_[i] = totalBalancesInUSD.mul(rewardPerToken().sub(_userRewardPerTokenPaid[_user])).div(_protocolValueInUSD);
+			_tokenValuesInUSD[i] = _tokenBalanceValueInUSD;
 		}
+
 		if (totalBalancesInUSD.mul(WHOLE).div(prfiValueInUSD) < REQUIRED_RATIO_AMOUNT) {
-			return new uint256[](length);
+			return rewards_;
 		}
+
+		for (uint256 i; i < length; i++) {
+			if (_tokenValuesInUSD[i] == 0) {
+				continue;
+			}
+			rewards_[i] = _tokenValuesInUSD[i].mul(rewardPerToken().sub(_userRewardPerTokenPaid[_user])).div(1e18);
+		}
+
 		return rewards_;
 	}
 
