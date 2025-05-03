@@ -392,11 +392,13 @@ contract RewardDistributionController is OApp, IRewardDistributionController, Re
 			return rewards_;
 		}
 
+		uint256 rewardsPerToken = rewardPerToken().sub(_userRewardPerTokenPaid[_user]);
+
 		for (uint256 i; i < length; i++) {
 			if (_tokenValuesInUSD[i] == 0) {
 				continue;
 			}
-			rewards_[i] = _tokenValuesInUSD[i].mul(rewardPerToken().sub(_userRewardPerTokenPaid[_user])).div(1e18);
+			rewards_[i] = _tokenValuesInUSD[i].mul(rewardsPerToken).div(1e18);
 		}
 
 		return rewards_;
